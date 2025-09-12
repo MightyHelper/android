@@ -398,4 +398,18 @@ public interface AppPreferences {
 
     String getLastDisplayedAccountName();
     void setLastDisplayedAccountName(String lastDisplayedAccountName);
+
+    /**
+     * Gets the maximum number of concurrent uploads configured by the user.
+     *
+     * @return maximum concurrent uploads (default: 1 for backward compatibility)
+     */
+    int getMaxConcurrentUploads();
+
+    /**
+     * Sets the maximum number of concurrent uploads.
+     *
+     * @param maxConcurrentUploads maximum number of uploads to run in parallel (1-10)
+     */
+    void setMaxConcurrentUploads(int maxConcurrentUploads);
 }

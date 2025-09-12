@@ -37,6 +37,8 @@ import com.owncloud.android.operations.UploadFileOperation
 import com.owncloud.android.utils.ErrorMessageAdapter
 import com.owncloud.android.utils.theme.ViewThemeUtils
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 
 @Suppress("LongParameterList")
@@ -97,6 +99,12 @@ class FileUploadWorker(
     private val notificationManager = UploadNotificationManager(context, viewThemeUtils, Random.nextInt())
     private val intents = FileUploaderIntents(context)
     private val fileUploaderDelegate = FileUploaderDelegate()
+    private val uploadExecutorService = UploadExecutorService(preferences)
+
+    @Suppress("MagicNumber")
+    private val minProgressUpdateInterval = 750
+    private var lastUpdateTime = 0L
+    private val progressLock = Any()
 
     @Suppress("TooGenericExceptionCaught")
     override fun doWork(): Result = try {
@@ -120,6 +128,7 @@ class FileUploadWorker(
         setIdleWorkerState()
         currentUploadFileOperation?.cancel(null)
         notificationManager.dismissNotification()
+        uploadExecutorService.shutdown()
 
         super.onStopped()
     }
@@ -171,6 +180,25 @@ class FileUploadWorker(
         val ocAccount = OwnCloudAccount(user.toPlatformAccount(), context)
         val client = OwnCloudClientManagerFactory.getDefaultSingleton().getClientFor(ocAccount, context)
 
+        // Check if we should use parallel or sequential uploads
+        val maxConcurrentUploads = preferences.maxConcurrentUploads
+        return if (maxConcurrentUploads > 1) {
+            Log_OC.d(TAG, "Processing uploads with $maxConcurrentUploads concurrent threads")
+            processUploadsParallel(uploads, user, client, previouslyUploadedFileSize, totalUploadSize)
+        } else {
+            Log_OC.d(TAG, "Processing uploads sequentially (backward compatibility mode)")
+            processUploadsSequential(uploads, user, client, previouslyUploadedFileSize, totalUploadSize)
+        }
+    }
+
+    @Suppress("ReturnCount")
+    private fun processUploadsSequential(
+        uploads: List<OCUpload>,
+        user: User,
+        client: OwnCloudClient,
+        previouslyUploadedFileSize: Int,
+        totalUploadSize: Int
+    ): Result {
         for ((index, upload) in uploads.withIndex()) {
             if (preferences.isGlobalUploadPaused) {
                 Log_OC.d(TAG, "Upload is paused, skip uploading files!")
@@ -209,6 +237,104 @@ class FileUploadWorker(
         }
 
         return Result.success()
+    }
+
+    @Suppress("ReturnCount")
+    private fun processUploadsParallel(
+        uploads: List<OCUpload>,
+        user: User,
+        client: OwnCloudClient,
+        previouslyUploadedFileSize: Int,
+        totalUploadSize: Int
+    ): Result {
+        if (uploads.isEmpty()) {
+            return Result.success()
+        }
+
+        val executorService = uploadExecutorService.getExecutorService()
+        val latch = CountDownLatch(uploads.size)
+        val completedCount = AtomicInteger(0)
+        val errorCount = AtomicInteger(0)
+
+        Log_OC.d(TAG, "Starting parallel upload of ${uploads.size} files")
+
+        uploads.forEachIndexed { index, upload ->
+            executorService.submit {
+                try {
+                    if (preferences.isGlobalUploadPaused) {
+                        Log_OC.d(TAG, "Upload is paused, skipping file: ${upload.localPath}")
+                        latch.countDown()
+                        return@submit
+                    }
+
+                    if (canExitEarly() || isStopped) {
+                        latch.countDown()
+                        return@submit
+                    }
+
+                    setWorkerState(user)
+                    val operation = createUploadFileOperation(upload, user)
+                    
+                    // Thread-safe access to current operation
+                    synchronized(this@FileUploadWorker) {
+                        currentUploadFileOperation = operation
+                    }
+
+                    val currentIndex = (index + 1)
+                    val currentUploadIndex = (currentIndex + previouslyUploadedFileSize)
+                    
+                    // Prepare notification for this upload
+                    notificationManager.prepareForStart(
+                        operation,
+                        cancelPendingIntent = intents.startIntent(operation),
+                        startIntent = intents.notificationStartIntent(operation),
+                        currentUploadIndex = currentUploadIndex,
+                        totalUploadSize = totalUploadSize
+                    )
+
+                    // Perform the upload
+                    val result = upload(operation, user, client)
+                    
+                    // Clean up current operation reference
+                    synchronized(this@FileUploadWorker) {
+                        if (currentUploadFileOperation == operation) {
+                            currentUploadFileOperation = null
+                        }
+                    }
+                    
+                    // Track completion
+                    val completed = completedCount.incrementAndGet()
+                    if (!result.isSuccess) {
+                        errorCount.incrementAndGet()
+                    }
+                    
+                    Log_OC.d(TAG, "Upload completed ($completed/${uploads.size}): ${upload.localPath}")
+                    sendUploadFinishEvent(totalUploadSize, currentUploadIndex, operation, result)
+                    
+                } catch (e: Exception) {
+                    Log_OC.e(TAG, "Error in parallel upload", e)
+                    errorCount.incrementAndGet()
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+
+        // Wait for all uploads to complete
+        try {
+            latch.await()
+            Log_OC.d(TAG, "All parallel uploads completed. Errors: ${errorCount.get()}/${uploads.size}")
+        } catch (e: InterruptedException) {
+            Log_OC.e(TAG, "Parallel upload interrupted", e)
+            return Result.failure()
+        }
+
+        // Return success if at least some uploads succeeded
+        return if (errorCount.get() < uploads.size) {
+            Result.success()
+        } else {
+            Result.failure()
+        }
     }
 
     private fun sendUploadFinishEvent(
@@ -387,6 +513,7 @@ class FileUploadWorker(
 
     /**
      * Receives from [com.owncloud.android.operations.UploadFileOperation.normalUpload]
+     * Thread-safe progress reporting for concurrent uploads
      */
     @Suppress("MagicNumber")
     override fun onTransferProgress(
@@ -398,31 +525,33 @@ class FileUploadWorker(
         val percent = getPercent(totalTransferredSoFar, totalToTransfer)
         val currentTime = System.currentTimeMillis()
 
-        if (percent != lastPercent && (currentTime - lastUpdateTime) >= minProgressUpdateInterval) {
-            notificationManager.run {
-                val accountName = currentUploadFileOperation?.user?.accountName
-                val remotePath = currentUploadFileOperation?.remotePath
+        // Synchronize progress updates to avoid race conditions in concurrent uploads
+        synchronized(progressLock) {
+            if (percent != lastPercent && (currentTime - lastUpdateTime) >= minProgressUpdateInterval) {
+                notificationManager.run {
+                    val accountName = currentUploadFileOperation?.user?.accountName
+                    val remotePath = currentUploadFileOperation?.remotePath
 
-                updateUploadProgress(percent, currentUploadFileOperation)
+                    updateUploadProgress(percent, currentUploadFileOperation)
 
-                if (accountName != null && remotePath != null) {
-                    val key: String = FileUploadHelper.buildRemoteName(accountName, remotePath)
-                    val boundListener = FileUploadHelper.mBoundListeners[key]
-                    val filename = currentUploadFileOperation?.fileName ?: ""
+                    if (accountName != null && remotePath != null) {
+                        val key: String = FileUploadHelper.buildRemoteName(accountName, remotePath)
+                        val boundListener = FileUploadHelper.mBoundListeners[key]
+                        val filename = currentUploadFileOperation?.fileName ?: ""
 
-                    boundListener?.onTransferProgress(
-                        progressRate,
-                        totalTransferredSoFar,
-                        totalToTransfer,
-                        filename
-                    )
+                        boundListener?.onTransferProgress(
+                            progressRate,
+                            totalTransferredSoFar,
+                            totalToTransfer,
+                            filename
+                        )
+                    }
+
+                    dismissOldErrorNotification(currentUploadFileOperation)
                 }
-
-                dismissOldErrorNotification(currentUploadFileOperation)
+                lastUpdateTime = currentTime
+                lastPercent = percent
             }
-            lastUpdateTime = currentTime
         }
-
-        lastPercent = percent
     }
 }
