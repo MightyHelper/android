@@ -238,10 +238,10 @@ android {
 
         reports {
             xml {
-                destination = layout.buildDirectory.file("reports/pmd/pmd.xml").get().asFile
+                outputFile = layout.buildDirectory.file("reports/pmd/pmd.xml").get().asFile
             }
             html {
-                destination = layout.buildDirectory.file("reports/pmd/pmd.html").get().asFile
+                outputFile = layout.buildDirectory.file("reports/pmd/pmd.html").get().asFile
             }
         }
     }
