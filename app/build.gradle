@@ -101,6 +101,8 @@ def getConfigProperties() {
 def configProps = getConfigProperties()
 
 android {
+    compileSdk = 35
+    
     // install this NDK version and Cmake to produce smaller APKs. Build will still work if not installed
     ndkVersion = "${ndkEnv.get("NDK_VERSION")}"
 
@@ -116,7 +118,6 @@ android {
         applicationId = "com.nextcloud.client"
         minSdk = 27
         targetSdk = 35
-        compileSdk = 35
 
         buildConfigField "boolean", "CI", ciBuild.toString()
         buildConfigField "boolean", "RUNTIME_PERF_ANALYSIS", perfAnalysis.toString()
@@ -238,10 +239,12 @@ android {
 
         reports {
             xml {
-                outputFile = layout.buildDirectory.file("reports/pmd/pmd.xml").get().asFile
+                required = true
+                outputLocation = layout.buildDirectory.file("reports/pmd/pmd.xml")
             }
             html {
-                outputFile = layout.buildDirectory.file("reports/pmd/pmd.html").get().asFile
+                required = true
+                outputLocation = layout.buildDirectory.file("reports/pmd/pmd.html")
             }
         }
     }
